@@ -29,7 +29,7 @@
 #include <string.h>
 #include <stdarg.h>
 
-#define TWEAK_VERSION "0.1.0"
+#define TWEAK_VERSION "0.1.1"
 #define BUNDLE_SNIPER3D_NS @"com.fungames.sniper3d"   /* NSString 版（isEqualToString 用） */
 #define CFG_BASE  "camp_config"
 #define LOG_NAME  "camp_tweak.log"
@@ -58,6 +58,7 @@ static fn_class_get_method   il2cpp_class_get_method_from_name;
 static BOOL gBound = NO;
 static BOOL gReady = NO;         /* ≥1 钩挂上 */
 static BOOL gGaveUp = NO;
+static BOOL gIdle = NO;          /* master=0 待命（完全不挂钩） */
 static int  gAttempts = 0;
 static void *gImgs[128];         /* il2cpp image 指针缓存 */
 static int   gImgN = 0;
@@ -279,8 +280,24 @@ static void scheduleRetry(void) {
 }
 
 static void setupStep(void) {
-    if (gGaveUp) return;
+    if (gGaveUp && !gIdle) return;
     @try {
+        /* ★ master=0 = 真不挂钩：MSHook 一个都不装，热开配置后 5 秒内自动装上 */
+        if (!cfg.master) {
+            if (!gIdle) {
+                gIdle = YES;
+                gGaveUp = NO;           /* 待命结束后来一轮新装配 */
+                TLog(@"[CAMP] master=0 —— 不挂钩待命中（把 camp_config.json 的 master 改 true，5 秒内热装）");
+            }
+            scheduleRetry();
+            return;
+        }
+        if (gIdle) {                    /* 待命 → 激活：重置装配状态 */
+            gIdle = NO;
+            gAttempts = 0;
+            gImgN = 0;
+            TLog(@"[CAMP] master=true —— 开始挂钩装配");
+        }
         gAttempts++;
         if (!gBound && !bindIl2cpp()) { scheduleRetry(); return; }
 
@@ -334,6 +351,7 @@ static void setupStep(void) {
         TLog(@"[CAMP] 配置: master=%d fix_required=%d fix_recommended=%d no_ballistics=%d (%@)",
              (int)cfg.master, (int)cfg.fixRequired, (int)cfg.fixRecommended, (int)cfg.noBallistics, gCfgPath);
 
+        startTimers();   /* 心跳+配置热载立即开跑（master=0 待命时也照常） */
         dispatch_async(dispatch_get_main_queue(), ^{ setupStep(); });
     }
 }
