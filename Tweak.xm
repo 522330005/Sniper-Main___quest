@@ -29,7 +29,7 @@
 #include <string.h>
 #include <stdarg.h>
 
-#define TWEAK_VERSION "0.1.1"
+#define TWEAK_VERSION "0.2.0"
 #define BUNDLE_SNIPER3D_NS @"com.fungames.sniper3d"   /* NSString 版（isEqualToString 用） */
 #define CFG_BASE  "camp_config"
 #define LOG_NAME  "camp_tweak.log"
@@ -97,9 +97,11 @@ typedef struct {
     BOOL fixRequired;     /* Profile.get_IsUpgradeRequired → false */
     BOOL fixRecommended;  /* Profile.get_IsUpgradeRecommended → false */
     BOOL noBallistics;    /* App.get_DisableBallistics → true（去下坠+风向） */
+    BOOL infAmmo;         /* ★ v0.2.0 无限子弹（开火前 currentAmmo=maxAmmo） */
+    BOOL noCd;            /* ★ v0.2.0 射击无冷却（_shootCoolDown 归零） */
 } CampConfig;
 
-static CampConfig cfg = { YES, YES, YES, YES };
+static CampConfig cfg = { YES, YES, YES, YES, YES, YES };
 
 static BOOL JsonBool(NSDictionary *j, NSString *key, BOOL dflt) {
     id v = j[key];
@@ -117,6 +119,8 @@ static void LoadConfig(void) {
         cfg.fixRequired    = JsonBool(j, @"fix_required", YES);
         cfg.fixRecommended = JsonBool(j, @"fix_recommended", YES);
         cfg.noBallistics   = JsonBool(j, @"no_ballistics", YES);
+        cfg.infAmmo        = JsonBool(j, @"infinite_ammo", YES);
+        cfg.noCd           = JsonBool(j, @"no_cooldown", YES);
     } @catch (NSException *e) { /* 配置坏 = 沿用当前值 */ }
 }
 
@@ -127,18 +131,21 @@ static void WriteDefaultConfig(void) {
                       "  \"master\": true,\n"
                       "  \"fix_required\": true,\n"
                       "  \"fix_recommended\": true,\n"
-                      "  \"no_ballistics\": true\n"
+                      "  \"no_ballistics\": true,\n"
+                      "  \"infinite_ammo\": true,\n"
+                      "  \"no_cooldown\": true\n"
                       "}\n";
         [s writeToFile:gCfgPath atomically:YES encoding:NSUTF8StringEncoding error:NULL];
     } @catch (NSException *e) {}
 }
 
 /* ───────────────────────── 三个钩子（替换体读 cfg ⇒ 热开关生效） ───────────────────────── */
-static long nReqBlocked = 0, nRecBlocked = 0, nBalForced = 0;
+static long nReqBlocked = 0, nRecBlocked = 0, nBalForced = 0, nShootRefill = 0;
 
 static BOOL (*orig_req)(void *) = NULL;
 static BOOL (*orig_rec)(void *) = NULL;
 static BOOL (*orig_bal)(void *) = NULL;
+static void (*orig_shoot)(void *) = NULL;
 
 /* Profile.get_IsUpgradeRequired（实例方法，x0=this，忽略） */
 static BOOL my_req(void *self) {
@@ -222,9 +229,38 @@ static void *findMethodInfo(const char *clsName, const char *methName, int argc)
     return NULL;
 }
 
-static BOOL hReq = NO, hRec = NO, hBal = NO;
+static BOOL hReq = NO, hRec = NO, hBal = NO, hShoot = NO;
 
-/* 幂等：已挂的不重复挂；返回当前已挂总数（0~3） */
+/* ───────────────────────── ★ v0.2.0 无限子弹 + 射击无冷却 ─────────────────────────
+ * CharacterShooter（dump 107451）：
+ *   +0x94  float _shootCoolDown   —— 每枪冷却时长（WaitCoolDown 协程等它，归零=瞬过）
+ *   +0xC8  List<ParamsByCategory> characterShooterParamsByCategory
+ *          List+0x10 = items 数组；List+0x18 = 数量；元素+0x18 = currentAmmo(int)；元素+0x1C = maxAmmo(int)
+ * 钩 CharacterShooter.Shoot()（开火入口，按名解析，argc=0）：
+ *   onEnter：①infAmmo → 开火前把所有类别弹药写满  ②noCd → _shootCoolDown 归零
+ *   cfg 钩体内直读 ⇒ camp_config.json 热开关照常生效 */
+static void refillAmmo(void *shooter) {
+    void *list = *(void **)((char *)shooter + 0xC8);
+    if (!list) return;
+    void *items = *(void **)((char *)list + 0x10);
+    if (!items) return;
+    int n = *(int *)((char *)list + 0x18);
+    if (n <= 0 || n > 8) return;
+    for (int i = 0; i < n; i++) {
+        void *it = *(void **)((char *)items + 8 * i);
+        if (!it) continue;
+        int cap = *(int *)((char *)it + 0x1C);
+        if (cap > 0) *(int *)((char *)it + 0x18) = cap;
+    }
+    nShootRefill++;
+}
+static void my_shoot(void *self) {
+    if (cfg.infAmmo) refillAmmo(self);
+    if (cfg.noCd) *(float *)((char *)self + 0x94) = 0.0f;
+    orig_shoot(self);
+}
+
+/* 幂等：已挂的不重复挂；返回当前已挂总数（0~4） */
 static int installHooks(void) {
     if (!hReq) {
         void *m = findMethodInfo("Profile", "get_IsUpgradeRequired", 0);
@@ -250,7 +286,15 @@ static int installHooks(void) {
             else TLog(@"[CAMP] ❌ MSHookFunction(get_DisableBallistics) 失败");
         }
     }
-    return (hReq ? 1 : 0) + (hRec ? 1 : 0) + (hBal ? 1 : 0);
+    if (!hShoot) {
+        void *m = findMethodInfo("CharacterShooter", "Shoot", 0);
+        if (m) {
+            MSHookFunction(*(void **)m, (void *)my_shoot, (void **)&orig_shoot);
+            if (orig_shoot) { hShoot = YES; TLog(@"[CAMP] ✅ CharacterShooter.Shoot → 无限弹+无冷却 已挂（cfg 开关热生效）"); }
+            else TLog(@"[CAMP] ❌ MSHookFunction(CharacterShooter.Shoot) 失败");
+        }
+    }
+    return (hReq ? 1 : 0) + (hRec ? 1 : 0) + (hBal ? 1 : 0) + (hShoot ? 1 : 0);
 }
 
 /* ───────────────────────── 心跳 + 配置热载 ───────────────────────── */
@@ -261,8 +305,8 @@ static void startTimers(void) {
             static long hb = 0;
             hb++;
             if (hb % 10 == 0) {
-                TLog(@"[心跳] 进程活着  req拦=%ld  rec拦=%ld  弹道闸=%ld  ready=%d gaveUp=%d",
-                     nReqBlocked, nRecBlocked, nBalForced, (int)gReady, (int)gGaveUp);
+                TLog(@"[心跳] 进程活着  req拦=%ld  rec拦=%ld  弹道闸=%ld  开火补弹=%ld  ready=%d gaveUp=%d",
+                     nReqBlocked, nRecBlocked, nBalForced, nShootRefill, (int)gReady, (int)gGaveUp);
             }
         }];
         [NSTimer scheduledTimerWithTimeInterval:5.0 repeats:YES block:^(NSTimer *t) {
@@ -311,16 +355,16 @@ static void setupStep(void) {
             TLog(@"[CAMP] 第 %d 次装配：image=%d", gAttempts, gImgN);
 
         int total = installHooks();
-        if (total == 3) {
+        if (total >= 4) {
             gReady = YES;
-            TLog(@"[CAMP][LOADED] SniperCAMP v%s —— 3/3 钩就位（进任务两钩 + 弹道总闸一钩）", TWEAK_VERSION);
+            TLog(@"[CAMP][LOADED] SniperCAMP v%s —— 4/4 钩就位（进任务两钩 + 弹道闸 + 无限弹/无冷却）", TWEAK_VERSION);
             startTimers();
             return;
         }
         if (gAttempts >= MAX_ATTEMPTS) {
             gGaveUp = YES;
-            TLog(@"[CAMP] ❌ %d 次后仍缺钩：req=%d rec=%d bal=%d —— 停止重试（游戏版本类名变了？）",
-                 gAttempts, (int)hReq, (int)hRec, (int)hBal);
+            TLog(@"[CAMP] ❌ %d 次后仍缺钩：req=%d rec=%d bal=%d shoot=%d —— 停止重试（游戏版本类名变了？）",
+                 gAttempts, (int)hReq, (int)hRec, (int)hBal, (int)hShoot);
             startTimers();
             return;
         }
@@ -348,8 +392,8 @@ static void setupStep(void) {
         LoadConfig();
         TLog(@"================== SniperCAMP v%s 注入（bundle=%@）==================",
              TWEAK_VERSION, bid);
-        TLog(@"[CAMP] 配置: master=%d fix_required=%d fix_recommended=%d no_ballistics=%d (%@)",
-             (int)cfg.master, (int)cfg.fixRequired, (int)cfg.fixRecommended, (int)cfg.noBallistics, gCfgPath);
+        TLog(@"[CAMP] 配置: master=%d fix_required=%d fix_recommended=%d no_ballistics=%d infinite_ammo=%d no_cooldown=%d (%@)",
+             (int)cfg.master, (int)cfg.fixRequired, (int)cfg.fixRecommended, (int)cfg.noBallistics, (int)cfg.infAmmo, (int)cfg.noCd, gCfgPath);
 
         startTimers();   /* 心跳+配置热载立即开跑（master=0 待命时也照常） */
         dispatch_async(dispatch_get_main_queue(), ^{ setupStep(); });
