@@ -29,7 +29,11 @@
 #include <string.h>
 #include <stdarg.h>
 
-#define TWEAK_VERSION "0.2.0"
+#define TWEAK_VERSION "0.3.0"
+/* ★ v0.3.0（2026-10-12）：同步 frida v1.4/v1.5 两个关键修复——
+ *   ①refillAmmo 数组偏移 items+0x20 起（旧版 +0x00 读到数组头，无限弹失效根因）
+ *   ②my_shoot 补 _coolingDown(0x11C)=false / IsWeaponReady(0x68)=true + 第 5 钩 get_IsWeaponReady→true
+ *     （游戏扣扳机先查就绪态，冷却中根本不调 Shoot——必须在源头开闸，frida v1.4 实测教训） */
 #define BUNDLE_SNIPER3D_NS @"com.fungames.sniper3d"   /* NSString 版（isEqualToString 用） */
 #define CFG_BASE  "camp_config"
 #define LOG_NAME  "camp_tweak.log"
@@ -146,6 +150,11 @@ static BOOL (*orig_req)(void *) = NULL;
 static BOOL (*orig_rec)(void *) = NULL;
 static BOOL (*orig_bal)(void *) = NULL;
 static void (*orig_shoot)(void *) = NULL;
+static BOOL (*orig_ready)(void *) = NULL;
+static BOOL my_ready(void *self) {
+    if (cfg.noCd) return TRUE;   /* ★ v0.3.0 无冷却=扳机闸门恒开（游戏冷却中不调 Shoot，必须在源头开闸） */
+    return orig_ready(self);
+}
 
 /* Profile.get_IsUpgradeRequired（实例方法，x0=this，忽略） */
 static BOOL my_req(void *self) {
@@ -229,7 +238,7 @@ static void *findMethodInfo(const char *clsName, const char *methName, int argc)
     return NULL;
 }
 
-static BOOL hReq = NO, hRec = NO, hBal = NO, hShoot = NO;
+static BOOL hReq = NO, hRec = NO, hBal = NO, hShoot = NO, hReady = NO;
 
 /* ───────────────────────── ★ v0.2.0 无限子弹 + 射击无冷却 ─────────────────────────
  * CharacterShooter（dump 107451）：
@@ -244,10 +253,13 @@ static void refillAmmo(void *shooter) {
     if (!list) return;
     void *items = *(void **)((char *)list + 0x10);
     if (!items) return;
-    int n = *(int *)((char *)list + 0x18);
-    if (n <= 0 || n > 8) return;
+    /* ★ v0.3.0 数组偏移修复（对齐 frida v1.5/aim.js 实战口径）：
+     *   Il2CppArray 元素从 items+0x20 起（0x10/0x18 是对象头），长度在 items+0x18；
+     *   旧版从 items+0x00 起读到数组头当指针 → isNull 全跳过 = 无限弹失效根因 */
+    int n = *(int *)((char *)items + 0x18);
+    if (n <= 0 || n > 32) return;
     for (int i = 0; i < n; i++) {
-        void *it = *(void **)((char *)items + 8 * i);
+        void *it = *(void **)((char *)items + 0x20 + 8 * i);
         if (!it) continue;
         int cap = *(int *)((char *)it + 0x1C);
         if (cap > 0) *(int *)((char *)it + 0x18) = cap;
@@ -256,7 +268,11 @@ static void refillAmmo(void *shooter) {
 }
 static void my_shoot(void *self) {
     if (cfg.infAmmo) refillAmmo(self);
-    if (cfg.noCd) *(float *)((char *)self + 0x94) = 0.0f;
+    if (cfg.noCd) {
+        *(float *)((char *)self + 0x94) = 0.0f;   /* 冷却时长归零 */
+        *(char *)((char *)self + 0x11C) = 0;      /* ★ v0.3.0 _coolingDown = false（清已启动的冷却态） */
+        *(char *)((char *)self + 0x68) = 1;       /* ★ v0.3.0 IsWeaponReady backing = true */
+    }
     orig_shoot(self);
 }
 
@@ -294,7 +310,15 @@ static int installHooks(void) {
             else TLog(@"[CAMP] ❌ MSHookFunction(CharacterShooter.Shoot) 失败");
         }
     }
-    return (hReq ? 1 : 0) + (hRec ? 1 : 0) + (hBal ? 1 : 0) + (hShoot ? 1 : 0);
+    if (!hReady) {
+        void *m = findMethodInfo("CharacterShooter", "get_IsWeaponReady", 0);
+        if (m) {
+            MSHookFunction(*(void **)m, (void *)my_ready, (void **)&orig_ready);
+            if (orig_ready) { hReady = YES; TLog(@"[CAMP] ✅ CharacterShooter.get_IsWeaponReady → true 已挂（扳机闸门恒开）"); }
+            else TLog(@"[CAMP] ❌ MSHookFunction(get_IsWeaponReady) 失败");
+        }
+    }
+    return (hReq ? 1 : 0) + (hRec ? 1 : 0) + (hBal ? 1 : 0) + (hShoot ? 1 : 0) + (hReady ? 1 : 0);
 }
 
 /* ───────────────────────── 心跳 + 配置热载 ───────────────────────── */
@@ -355,16 +379,16 @@ static void setupStep(void) {
             TLog(@"[CAMP] 第 %d 次装配：image=%d", gAttempts, gImgN);
 
         int total = installHooks();
-        if (total >= 4) {
+        if (total >= 5) {
             gReady = YES;
-            TLog(@"[CAMP][LOADED] SniperCAMP v%s —— 4/4 钩就位（进任务两钩 + 弹道闸 + 无限弹/无冷却）", TWEAK_VERSION);
+            TLog(@"[CAMP][LOADED] SniperCAMP v%s —— 5/5 钩就位（进任务两钩 + 弹道闸 + 无限弹/无冷却/扳机闸门）", TWEAK_VERSION);
             startTimers();
             return;
         }
         if (gAttempts >= MAX_ATTEMPTS) {
             gGaveUp = YES;
-            TLog(@"[CAMP] ❌ %d 次后仍缺钩：req=%d rec=%d bal=%d shoot=%d —— 停止重试（游戏版本类名变了？）",
-                 gAttempts, (int)hReq, (int)hRec, (int)hBal, (int)hShoot);
+            TLog(@"[CAMP] ❌ %d 次后仍缺钩：req=%d rec=%d bal=%d shoot=%d ready=%d —— 停止重试（游戏版本类名变了？）",
+                 gAttempts, (int)hReq, (int)hRec, (int)hBal, (int)hShoot, (int)hReady);
             startTimers();
             return;
         }
