@@ -29,8 +29,12 @@
 #include <string.h>
 #include <stdarg.h>
 
-#define TWEAK_VERSION "0.3.0"
-/* ★ v0.3.0（2026-10-12）：同步 frida v1.4/v1.5 两个关键修复——
+#define TWEAK_VERSION "0.4.0"
+/* ★ v0.4.0（2026-10-12）：模式门控——真机实测 PVP 一局无限弹/无冷却全开（ArenaCharacterShooter
+ *   继承基类 Shoot 被误放行）。修复：my_shoot 每次开火用 il2cpp_object_get_class 查对象类名，
+ *   白名单=基类 CharacterShooter（主线/特别行动），子类 Arena/Halloween/Christmas 一律不放行；
+ *   my_req/my_rec/my_bal 同受 gInCampaignMode 门控。camp_config.json 的 mode_gate=false 可关掉门控。
+ * ★ v0.3.0（2026-10-12）：同步 frida v1.4/v1.5 两个关键修复——
  *   ①refillAmmo 数组偏移 items+0x20 起（旧版 +0x00 读到数组头，无限弹失效根因）
  *   ②my_shoot 补 _coolingDown(0x11C)=false / IsWeaponReady(0x68)=true + 第 5 钩 get_IsWeaponReady→true
  *     （游戏扣扳机先查就绪态，冷却中根本不调 Shoot——必须在源头开闸，frida v1.4 实测教训） */
@@ -49,6 +53,7 @@ typedef size_t (*fn_img_class_count)(void *);
 typedef void *(*fn_img_get_class)(void *, size_t);
 typedef const char *(*fn_class_name)(void *);
 typedef void *(*fn_class_get_method)(void *, const char *, int);
+typedef void *(*fn_obj_get_class)(void *);
 
 static fn_domain_get         il2cpp_domain_get;
 static fn_thread_attach      il2cpp_thread_attach;
@@ -58,6 +63,7 @@ static fn_img_class_count    il2cpp_image_get_class_count;
 static fn_img_get_class      il2cpp_image_get_class;
 static fn_class_name         il2cpp_class_get_name;
 static fn_class_get_method   il2cpp_class_get_method_from_name;
+static fn_obj_get_class      il2cpp_object_get_class;
 
 static BOOL gBound = NO;
 static BOOL gReady = NO;         /* ≥1 钩挂上 */
@@ -103,9 +109,11 @@ typedef struct {
     BOOL noBallistics;    /* App.get_DisableBallistics → true（去下坠+风向） */
     BOOL infAmmo;         /* ★ v0.2.0 无限子弹（开火前 currentAmmo=maxAmmo） */
     BOOL noCd;            /* ★ v0.2.0 射击无冷却（_shootCoolDown 归零） */
+    BOOL modeGate;        /* ★ v0.4.0 模式门控：只对基类 CharacterShooter（主线/特别行动）生效，
+                             子类 Arena=PVP / Halloween / Christmas=活动 一律不放行（真机实测：PVP 一局无限弹全开） */
 } CampConfig;
 
-static CampConfig cfg = { YES, YES, YES, YES, YES, YES };
+static CampConfig cfg = { YES, YES, YES, YES, YES, YES, YES };
 
 static BOOL JsonBool(NSDictionary *j, NSString *key, BOOL dflt) {
     id v = j[key];
@@ -125,6 +133,7 @@ static void LoadConfig(void) {
         cfg.noBallistics   = JsonBool(j, @"no_ballistics", YES);
         cfg.infAmmo        = JsonBool(j, @"infinite_ammo", YES);
         cfg.noCd           = JsonBool(j, @"no_cooldown", YES);
+        cfg.modeGate       = JsonBool(j, @"mode_gate", YES);
     } @catch (NSException *e) { /* 配置坏 = 沿用当前值 */ }
 }
 
@@ -137,7 +146,8 @@ static void WriteDefaultConfig(void) {
                       "  \"fix_recommended\": true,\n"
                       "  \"no_ballistics\": true,\n"
                       "  \"infinite_ammo\": true,\n"
-                      "  \"no_cooldown\": true\n"
+                      "  \"no_cooldown\": true,\n"
+                      "  \"mode_gate\": true\n"
                       "}\n";
         [s writeToFile:gCfgPath atomically:YES encoding:NSUTF8StringEncoding error:NULL];
     } @catch (NSException *e) {}
@@ -151,26 +161,41 @@ static BOOL (*orig_rec)(void *) = NULL;
 static BOOL (*orig_bal)(void *) = NULL;
 static void (*orig_shoot)(void *) = NULL;
 static BOOL (*orig_ready)(void *) = NULL;
+static BOOL gInCampaignMode = YES;   /* ★ v0.4.0 模式态：由每次 Shoot 的对象类名刷新（默认 YES=战役优先） */
+
+/* ★ v0.4.0 模式门控：对象类名必须在白名单（基类 CharacterShooter=主线/特别行动）。
+ *   子类 ArenaCharacterShooter=PVP / Halloween / Christmas=活动 → NO（真机实测：PVP 一局无限弹全开）。
+ *   cfg.modeGate=false = 关闭门控（旧行为，全模式生效） */
+static BOOL modeAllowed(void *obj) {
+    if (!cfg.modeGate) return YES;
+    if (!il2cpp_object_get_class || !il2cpp_class_get_name) return YES;
+    void *cls = il2cpp_object_get_class(obj);
+    if (!cls) return NO;
+    const char *nm = il2cpp_class_get_name(cls);
+    if (!nm) return NO;
+    return strcmp(nm, "CharacterShooter") == 0;
+}
+
 static BOOL my_ready(void *self) {
-    if (cfg.noCd) return TRUE;   /* ★ v0.3.0 无冷却=扳机闸门恒开（游戏冷却中不调 Shoot，必须在源头开闸） */
+    if (cfg.noCd && gInCampaignMode) return TRUE;   /* ★ v0.4.0 闸门只在战役系开 */
     return orig_ready(self);
 }
 
 /* Profile.get_IsUpgradeRequired（实例方法，x0=this，忽略） */
 static BOOL my_req(void *self) {
-    if (cfg.master && cfg.fixRequired) { nReqBlocked++; return NO; }
+    if (cfg.master && cfg.fixRequired && gInCampaignMode) { nReqBlocked++; return NO; }
     return orig_req ? orig_req(self) : NO;
 }
 
 /* Profile.get_IsUpgradeRecommended（实例方法） */
 static BOOL my_rec(void *self) {
-    if (cfg.master && cfg.fixRecommended) { nRecBlocked++; return NO; }
+    if (cfg.master && cfg.fixRecommended && gInCampaignMode) { nRecBlocked++; return NO; }
     return orig_rec ? orig_rec(self) : NO;
 }
 
 /* App.get_DisableBallistics（静态方法，原始实现恒 mov w0,#0 → 关闸时返回 NO 与原行为一致） */
 static BOOL my_bal(void *self) {
-    if (cfg.master && cfg.noBallistics) { nBalForced++; return YES; }
+    if (cfg.master && cfg.noBallistics && gInCampaignMode) { nBalForced++; return YES; }
     return orig_bal ? orig_bal(self) : NO;
 }
 
@@ -194,11 +219,13 @@ static BOOL bindIl2cpp(void) {
     il2cpp_image_get_class         = (fn_img_get_class)dlsym(uf, "il2cpp_image_get_class");
     il2cpp_class_get_name          = (fn_class_name)dlsym(uf, "il2cpp_class_get_name");
     il2cpp_class_get_method_from_name = (fn_class_get_method)dlsym(uf, "il2cpp_class_get_method_from_name");
+    il2cpp_object_get_class         = (fn_obj_get_class)dlsym(uf, "il2cpp_object_get_class");
 
     gBound = il2cpp_domain_get && il2cpp_thread_attach &&
              il2cpp_domain_get_assemblies && il2cpp_assembly_get_image &&
              il2cpp_image_get_class_count && il2cpp_image_get_class &&
-             il2cpp_class_get_name && il2cpp_class_get_method_from_name;
+             il2cpp_class_get_name && il2cpp_class_get_method_from_name &&
+             il2cpp_object_get_class;
     if (!gBound) TLog(@"[CAMP] il2cpp 导出不齐（缺符号），下一轮重试");
     return gBound;
 }
@@ -267,8 +294,9 @@ static void refillAmmo(void *shooter) {
     nShootRefill++;
 }
 static void my_shoot(void *self) {
-    if (cfg.infAmmo) refillAmmo(self);
-    if (cfg.noCd) {
+    gInCampaignMode = modeAllowed(self);   /* ★ v0.4.0 每次开火刷新模式态（第一枪即纠正，PVP 第一发也不漏） */
+    if (cfg.infAmmo && gInCampaignMode) refillAmmo(self);
+    if (cfg.noCd && gInCampaignMode) {
         *(float *)((char *)self + 0x94) = 0.0f;   /* 冷却时长归零 */
         *(char *)((char *)self + 0x11C) = 0;      /* ★ v0.3.0 _coolingDown = false（清已启动的冷却态） */
         *(char *)((char *)self + 0x68) = 1;       /* ★ v0.3.0 IsWeaponReady backing = true */
@@ -276,7 +304,7 @@ static void my_shoot(void *self) {
     orig_shoot(self);
 }
 
-/* 幂等：已挂的不重复挂；返回当前已挂总数（0~4） */
+/* 幂等：已挂的不重复挂；返回当前已挂总数（0~5） */
 static int installHooks(void) {
     if (!hReq) {
         void *m = findMethodInfo("Profile", "get_IsUpgradeRequired", 0);
@@ -314,7 +342,7 @@ static int installHooks(void) {
         void *m = findMethodInfo("CharacterShooter", "get_IsWeaponReady", 0);
         if (m) {
             MSHookFunction(*(void **)m, (void *)my_ready, (void **)&orig_ready);
-            if (orig_ready) { hReady = YES; TLog(@"[CAMP] ✅ CharacterShooter.get_IsWeaponReady → true 已挂（扳机闸门恒开）"); }
+            if (orig_ready) { hReady = YES; TLog(@"[CAMP] ✅ CharacterShooter.get_IsWeaponReady → true 已挂（扳机闸门恒开，模式门控见 cfg.mode_gate）"); }
             else TLog(@"[CAMP] ❌ MSHookFunction(get_IsWeaponReady) 失败");
         }
     }
@@ -416,8 +444,8 @@ static void setupStep(void) {
         LoadConfig();
         TLog(@"================== SniperCAMP v%s 注入（bundle=%@）==================",
              TWEAK_VERSION, bid);
-        TLog(@"[CAMP] 配置: master=%d fix_required=%d fix_recommended=%d no_ballistics=%d infinite_ammo=%d no_cooldown=%d (%@)",
-             (int)cfg.master, (int)cfg.fixRequired, (int)cfg.fixRecommended, (int)cfg.noBallistics, (int)cfg.infAmmo, (int)cfg.noCd, gCfgPath);
+        TLog(@"[CAMP] 配置: master=%d fix_required=%d fix_recommended=%d no_ballistics=%d infinite_ammo=%d no_cooldown=%d mode_gate=%d (%@)",
+             (int)cfg.master, (int)cfg.fixRequired, (int)cfg.fixRecommended, (int)cfg.noBallistics, (int)cfg.infAmmo, (int)cfg.noCd, (int)cfg.modeGate, gCfgPath);
 
         startTimers();   /* 心跳+配置热载立即开跑（master=0 待命时也照常） */
         dispatch_async(dispatch_get_main_queue(), ^{ setupStep(); });

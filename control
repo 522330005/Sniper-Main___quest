@@ -1,8 +1,8 @@
 Package: com.sniper.camp
 Name: Sniper 主线+特别行动
-Version: 0.1.1
+Version: 0.4.0
 Architecture: iphoneos-arm64
-Description: 主线/特别行动·高级武器免限制进任务+结算 / 去风向 / 去子弹下坠（3钩最小集: Profile两闸 + App.get_DisableBallistics）★v0.1.1: master=0=完全不挂钩(真关,热开)
+Description: 主线/特别行动·进任务两闸+去风向/下坠+无限子弹+射击无冷却（5钩）★v0.4.0: 模式门控（PVP/活动不放行）+ 体力补满不误伤 + master=0=完全不挂钩(热开)
 Maintainer: sniper
 Author: sniper
 Section: Tweaks
