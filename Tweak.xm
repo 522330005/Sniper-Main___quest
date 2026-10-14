@@ -95,6 +95,8 @@ static void TLog(NSString *fmt, ...) {
         va_end(ap);
         NSString *line = [NSString stringWithFormat:@"[%@] %@\n", [df stringFromDate:[NSDate date]], s];
         [lk lock];
+        static BOOL logTrunc = NO;   /* ★ 每次游戏启动只截断一次：日志不跨局堆积（10:14 用户要求） */
+        if (!logTrunc) { logTrunc = YES; FILE *t = fopen(gLogPath.fileSystemRepresentation, "w"); if (t) fclose(t); }
         FILE *f = fopen(gLogPath.fileSystemRepresentation, "a");
         if (f) { fputs(line.UTF8String, f); fclose(f); }
         [lk unlock];
