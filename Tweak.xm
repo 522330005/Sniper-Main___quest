@@ -29,7 +29,7 @@
 #include <string.h>
 #include <stdarg.h>
 
-#define TWEAK_VERSION "0.4.0"
+#define TWEAK_VERSION "0.4.2"
 /* ★ v0.4.0（2026-10-12）：模式门控——真机实测 PVP 一局无限弹/无冷却全开（ArenaCharacterShooter
  *   继承基类 Shoot 被误放行）。修复：my_shoot 每次开火用 il2cpp_object_get_class 查对象类名，
  *   白名单=基类 CharacterShooter（主线/特别行动），子类 Arena/Halloween/Christmas 一律不放行；
@@ -37,6 +37,9 @@
  * ★ v0.3.0（2026-10-12）：同步 frida v1.4/v1.5 两个关键修复——
  *   ①refillAmmo 数组偏移 items+0x20 起（旧版 +0x00 读到数组头，无限弹失效根因）
  *   ②my_shoot 补 _coolingDown(0x11C)=false / IsWeaponReady(0x68)=true + 第 5 钩 get_IsWeaponReady→true
+ *   ★ 2026-10-15 偏移经 7.11.2 dump.cs 逐字段验证（CharacterShooter 主类 45 字段全表核对）：
+ *     0xC8=List<ParamsByCategory>弹药表 / 0x94=_shootCoolDown(float) / 0x11C=_coolingDown(bool) /
+ *     0x68=<IsWeaponReady>k__BackingField(bool) —— 7.10.1→7.11.2 布局完全一致
  *     （游戏扣扳机先查就绪态，冷却中根本不调 Shoot——必须在源头开闸，frida v1.4 实测教训） */
 #define BUNDLE_SNIPER3D_NS @"com.fungames.sniper3d"   /* NSString 版（isEqualToString 用） */
 #define CFG_BASE  "camp_config"
@@ -127,7 +130,12 @@ static void LoadConfig(void) {
     @try {
         NSData *d = [NSData dataWithContentsOfFile:gCfgPath];
         if (!d) return;
-        id j = [NSJSONSerialization JSONObjectWithData:d options:0 error:NULL];
+        NSError *jerr = nil;   /* v0.4.2：配置损坏不再静默吞——告警并沿用默认值 */
+        id j = [NSJSONSerialization JSONObjectWithData:d options:0 error:&jerr];
+        if (!j) {
+            TLog(@"[CAMP] ⚠️ 配置损坏/非法 JSON：%@ —— 已沿用默认配置", jerr.localizedDescription ?: @"(未知错误)");
+            return;
+        }
         if (![j isKindOfClass:[NSDictionary class]]) return;
         cfg.master         = JsonBool(j, @"master", YES);
         cfg.fixRequired    = JsonBool(j, @"fix_required", YES);
@@ -162,6 +170,7 @@ static BOOL (*orig_req)(void *) = NULL;
 static BOOL (*orig_rec)(void *) = NULL;
 static BOOL (*orig_bal)(void *) = NULL;
 static void (*orig_shoot)(void *) = NULL;
+static int nShootNull = 0;   /* v0.4.2 orig_shoot 为空的节流计数（先声明后用） */
 static BOOL (*orig_ready)(void *) = NULL;
 static BOOL gInCampaignMode = YES;   /* ★ v0.4.0 模式态：由每次 Shoot 的对象类名刷新（默认 YES=战役优先） */
 
@@ -303,7 +312,9 @@ static void my_shoot(void *self) {
         *(char *)((char *)self + 0x11C) = 0;      /* ★ v0.3.0 _coolingDown = false（清已启动的冷却态） */
         *(char *)((char *)self + 0x68) = 1;       /* ★ v0.3.0 IsWeaponReady backing = true */
     }
-    orig_shoot(self);
+    /* v0.4.2：MSHookFunction 失败时 orig 为 NULL，直接调用 = NULL 解引用闪退 → 守卫 */
+    if (orig_shoot) orig_shoot(self);
+    else if (nShootNull++ == 0) TLog(@"[CAMP] ⚠️ orig_shoot 为空 —— 开火已跳过（挂钩失败，重装 deb 或重启游戏）");
 }
 
 /* 幂等：已挂的不重复挂；返回当前已挂总数（0~5） */
