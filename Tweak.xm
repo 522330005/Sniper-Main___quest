@@ -29,8 +29,13 @@
 #include <string.h>
 #include <stdarg.h>
 
-#define TWEAK_VERSION "0.4.2"
-/* ★ v0.4.0（2026-10-12）：模式门控——真机实测 PVP 一局无限弹/无冷却全开（ArenaCharacterShooter
+#define TWEAK_VERSION "0.5.0"
+/* ★ v0.5.0（2026-10-16）：修 10-14 三次启动闪退（EXC_BAD_ACCESS 0x135，崩在 il2cpp 递归元数据查找）。
+ *   根因：类解析旧用全类迭代 il2cpp_image_get_class + 对每个同名类调 method_from_name，
+ *   冷启动半初始化元数据/同名异类会令 il2cpp 内部解引用空指针，@try/@catch 捕不了 SIGSEGV。
+ *   改法：findMethodInfo 改用 il2cpp_class_from_name(image, 命名空间, 类名) 精确定位，不迭代、不误碰同名异类。
+ *   命名空间（7.11.2 dump 实锤）：Profile=User / App=全局"" / CharacterShooter=Player。
+ * ★ v0.4.0（2026-10-12）：模式门控——真机实测 PVP 一局无限弹/无冷却全开（ArenaCharacterShooter
  *   继承基类 Shoot 被误放行）。修复：my_shoot 每次开火用 il2cpp_object_get_class 查对象类名，
  *   白名单=基类 CharacterShooter（主线/特别行动），子类 Arena/Halloween/Christmas 一律不放行；
  *   my_req/my_rec/my_bal 同受 gInCampaignMode 门控。camp_config.json 的 mode_gate=false 可关掉门控。
@@ -56,6 +61,7 @@ typedef size_t (*fn_img_class_count)(void *);
 typedef void *(*fn_img_get_class)(void *, size_t);
 typedef const char *(*fn_class_name)(void *);
 typedef void *(*fn_class_get_method)(void *, const char *, int);
+typedef void *(*fn_class_from_name)(void *, const char *, const char *);
 typedef void *(*fn_obj_get_class)(void *);
 
 static fn_domain_get         il2cpp_domain_get;
@@ -66,6 +72,7 @@ static fn_img_class_count    il2cpp_image_get_class_count;
 static fn_img_get_class      il2cpp_image_get_class;
 static fn_class_name         il2cpp_class_get_name;
 static fn_class_get_method   il2cpp_class_get_method_from_name;
+static fn_class_from_name    il2cpp_class_from_name;
 static fn_obj_get_class      il2cpp_object_get_class;
 
 static BOOL gBound = NO;
@@ -230,13 +237,14 @@ static BOOL bindIl2cpp(void) {
     il2cpp_image_get_class         = (fn_img_get_class)dlsym(uf, "il2cpp_image_get_class");
     il2cpp_class_get_name          = (fn_class_name)dlsym(uf, "il2cpp_class_get_name");
     il2cpp_class_get_method_from_name = (fn_class_get_method)dlsym(uf, "il2cpp_class_get_method_from_name");
+    il2cpp_class_from_name          = (fn_class_from_name)dlsym(uf, "il2cpp_class_from_name");
     il2cpp_object_get_class         = (fn_obj_get_class)dlsym(uf, "il2cpp_object_get_class");
 
     gBound = il2cpp_domain_get && il2cpp_thread_attach &&
              il2cpp_domain_get_assemblies && il2cpp_assembly_get_image &&
              il2cpp_image_get_class_count && il2cpp_image_get_class &&
              il2cpp_class_get_name && il2cpp_class_get_method_from_name &&
-             il2cpp_object_get_class;
+             il2cpp_class_from_name && il2cpp_object_get_class;
     if (!gBound) TLog(@"[CAMP] il2cpp 导出不齐（缺符号），下一轮重试");
     return gBound;
 }
@@ -256,22 +264,24 @@ static BOOL collectImages(void) {
     return cnt > 0;
 }
 
-/* 扫全部 image：类名匹配 且 目标方法存在且 methodPointer 非空 → 返回 MethodInfo*
- * （同名类歧义按"有没有这个方法"消歧；返回的指针直接给 MSHookFunction 解引用） */
-static void *findMethodInfo(const char *clsName, const char *methName, int argc) {
-    if (!gBound || gImgN == 0) return NULL;
+/* ★ v0.5.0 crash-safe 解析（2026-10-16，修 10-14 三次启动闪退）：
+ *   旧版 findMethodInfo 用 il2cpp_image_get_class 逐类全扫 + 对每个"同名类"调
+ *   il2cpp_class_get_method_from_name。冷启动/半初始化元数据，或同名异类（畸形/泛型类），
+ *   会让 il2cpp 内部递归解引用空指针 → SIGSEGV(0x135)，而 @try/@catch 捕不了段错误 = 必崩。
+ *   （崩溃报告铁证：SniperCAMP.dylib→il2cpp 递归帧→EXC_BAD_ACCESS 0x135，主线程 setup 路径。）
+ *   改用 il2cpp_class_from_name(image, 命名空间, 类名) 按 ns+name 精确定位：
+ *     · 不迭代未知类（消除踩坏指针的面）；
+ *     · 不误碰同名异类（避免对畸形同类调 method_from_name 触发 il2cpp 递归崩）。
+ *   命名空间（7.11.2 dump.cs 实锤）：Profile=User / App=全局(空串"") / CharacterShooter=Player。
+ *   代价：类若跨版本改命名空间会找不到 → 日志明确报"缺钩"并重试，绝不崩。 */
+static void *findMethodInfo(const char *ns, const char *clsName, const char *methName, int argc) {
+    if (!gBound || gImgN == 0 || !il2cpp_class_from_name) return NULL;
     for (int i = 0; i < gImgN; i++) {
-        size_t cc = 0;
-        @try { cc = il2cpp_image_get_class_count(gImgs[i]); } @catch (NSException *e) { continue; }
-        for (size_t j = 0; j < cc; j++) {
-            void *cls = NULL;
-            @try { cls = il2cpp_image_get_class(gImgs[i], j); } @catch (NSException *e) { continue; }
-            if (!cls) continue;
-            const char *cn = il2cpp_class_get_name(cls);
-            if (!cn || strcmp(cn, clsName) != 0) continue;
-            void *m = il2cpp_class_get_method_from_name(cls, methName, argc);
-            if (m && *(void **)m) return m;
-        }
+        void *cls = NULL;
+        @try { cls = il2cpp_class_from_name(gImgs[i], ns, clsName); } @catch (NSException *e) { continue; }
+        if (!cls) continue;
+        void *m = il2cpp_class_get_method_from_name(cls, methName, argc);
+        if (m && *(void **)m) return m;
     }
     return NULL;
 }
@@ -320,7 +330,7 @@ static void my_shoot(void *self) {
 /* 幂等：已挂的不重复挂；返回当前已挂总数（0~5） */
 static int installHooks(void) {
     if (!hReq) {
-        void *m = findMethodInfo("Profile", "get_IsUpgradeRequired", 0);
+        void *m = findMethodInfo("User", "Profile", "get_IsUpgradeRequired", 0);
         if (m) {
             MSHookFunction(*(void **)m, (void *)my_req, (void **)&orig_req);
             if (orig_req) { hReq = YES; TLog(@"[CAMP] ✅ Profile.get_IsUpgradeRequired → false 已挂"); }
@@ -328,7 +338,7 @@ static int installHooks(void) {
         }
     }
     if (!hRec) {
-        void *m = findMethodInfo("Profile", "get_IsUpgradeRecommended", 0);
+        void *m = findMethodInfo("User", "Profile", "get_IsUpgradeRecommended", 0);
         if (m) {
             MSHookFunction(*(void **)m, (void *)my_rec, (void **)&orig_rec);
             if (orig_rec) { hRec = YES; TLog(@"[CAMP] ✅ Profile.get_IsUpgradeRecommended → false 已挂"); }
@@ -336,7 +346,7 @@ static int installHooks(void) {
         }
     }
     if (!hBal) {
-        void *m = findMethodInfo("App", "get_DisableBallistics", 0);
+        void *m = findMethodInfo("", "App", "get_DisableBallistics", 0);
         if (m) {
             MSHookFunction(*(void **)m, (void *)my_bal, (void **)&orig_bal);
             if (orig_bal) { hBal = YES; TLog(@"[CAMP] ✅ App.get_DisableBallistics → true 已挂（去下坠+风向）"); }
@@ -344,7 +354,7 @@ static int installHooks(void) {
         }
     }
     if (!hShoot) {
-        void *m = findMethodInfo("CharacterShooter", "Shoot", 0);
+        void *m = findMethodInfo("Player", "CharacterShooter", "Shoot", 0);
         if (m) {
             MSHookFunction(*(void **)m, (void *)my_shoot, (void **)&orig_shoot);
             if (orig_shoot) { hShoot = YES; TLog(@"[CAMP] ✅ CharacterShooter.Shoot → 无限弹+无冷却 已挂（cfg 开关热生效）"); }
@@ -352,7 +362,7 @@ static int installHooks(void) {
         }
     }
     if (!hReady) {
-        void *m = findMethodInfo("CharacterShooter", "get_IsWeaponReady", 0);
+        void *m = findMethodInfo("Player", "CharacterShooter", "get_IsWeaponReady", 0);
         if (m) {
             MSHookFunction(*(void **)m, (void *)my_ready, (void **)&orig_ready);
             if (orig_ready) { hReady = YES; TLog(@"[CAMP] ✅ CharacterShooter.get_IsWeaponReady → true 已挂（扳机闸门恒开，模式门控见 cfg.mode_gate）"); }
