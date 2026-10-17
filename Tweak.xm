@@ -29,8 +29,9 @@
 #include <string.h>
 #include <stdarg.h>
 
-#define TWEAK_VERSION "0.5.1"
-/* ★ v0.5.1（2026-10-17）：修 master 总开关不管用——my_shoot(无限弹/无冷却) 和 my_ready(扳机闸门)
+#define TWEAK_VERSION "0.5.2"
+/* ★ v0.5.2（2026-10-18）：轻量化同步 campaign_min.js v1.8——装配重试不再每轮 gImgN=0 全扫 128 image(hammering 元数据=给内存添压)，改每 10 次才重扫(仍拾取后期 assembly)。JS 版实测主线/特别行动不闪退=坐实之前崩是设备内存，非代码。
+ * ★ v0.5.1（2026-10-17）：修 master 总开关不管用——my_shoot(无限弹/无冷却) 和 my_ready(扳机闸门)
  *   漏查 cfg.master，导致 master=0 只关了进任务弹窗/弹道闸，无限弹/无冷却/扳机闸门照发。现 5 钩全 gate cfg.master。
  * ★ v0.5.0（2026-10-16）：修 10-14 三次启动闪退（EXC_BAD_ACCESS 0x135，崩在 il2cpp 递归元数据查找）。
  *   根因：类解析旧用全类迭代 il2cpp_image_get_class + 对每个同名类调 method_from_name，
@@ -445,7 +446,10 @@ static void setupStep(void) {
             startTimers();
             return;
         }
-        gImgN = 0;   /* 强制下轮重扫（游戏启动早期 assembly 可能还没全载入） */
+        /* ★ v0.5.2 轻量化(同步 campaign_min.js v1.8 稳定版)：不再每次重试都 gImgN=0 重扫全部 image
+         *   (每 600ms 扫 128 个 image + 逐个 class_from_name = hammering 元数据，给本就紧张的内存添压)，
+         *   改成每 10 次重试才重扫一次 —— 仍能拾取启动后期才载入的 assembly，但不至于每轮都全扫。 */
+        if (gAttempts % 10 == 0) gImgN = 0;
         scheduleRetry();
     } @catch (NSException *e) {
         TLog(@"[CAMP] setup 异常: %@ —— 重试", e);
