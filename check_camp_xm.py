@@ -53,10 +53,13 @@ musts_raw = [
 ]
 musts_code = [
     ('%ctor', '%ctor 入口'),
-    ('MSHookFunction(*(void **)m, (void *)my_req, (void **)&orig_req)', '钩1 MSHook'),
-    ('MSHookFunction(*(void **)m, (void *)my_rec, (void **)&orig_rec)', '钩2 MSHook'),
-    ('MSHookFunction(*(void **)m, (void *)my_bal, (void **)&orig_bal)', '钩3 MSHook'),
-    ('my_bal', '钩3 替换体'),
+    ('MSHookFunction(*(void **)m, (void *)my_req, (void **)&orig_req)', '钩1 MSHook(进任务弹窗)'),
+    ('MSHookFunction(*(void **)m, (void *)my_rec, (void **)&orig_rec)', '钩2 MSHook(进任务弹窗)'),
+    ('MSHookFunction(*(void **)m, (void *)my_shoot, (void **)&orig_shoot)', '钩3 MSHook(Shoot 无限弹/无冷却)'),
+    ('static int patchU32(uintptr_t addr, uint32_t val)', '字节补丁写函数(v0.5.3)'),
+    ('vm_protect(mach_task_self()', '代码页可写(v0.5.3)'),
+    ('sys_icache_invalidate', '指令缓存刷新(v0.5.3)'),
+    ('static void updatePatches(void)', '补丁切换(v0.5.3)'),
     ('il2cpp_class_get_method_from_name', '方法解析 API'),
     ('il2cpp_thread_attach', '线程挂载'),
     ('MAX_ATTEMPTS', '重试上限'),
@@ -112,35 +115,40 @@ for m in re.finditer(r'TLog\(', src):
 
 # ---------- 5. 每个被调用函数都有定义（static 函数集合） ----------
 defs = set(re.findall(r'static\s+[\w\s\*]+?\b(\w+)\s*\(', code))
-for fn in ['TLog','LoadConfig','WriteDefaultConfig','JsonBool','my_req','my_rec','my_bal',
-           'bindIl2cpp','collectImages','findMethodInfo','installHooks','startTimers',
+for fn in ['TLog','LoadConfig','WriteDefaultConfig','JsonBool','my_req','my_rec','my_shoot',
+           'patchU32','updatePatches','bindIl2cpp','collectImages','findMethodInfo','installHooks','startTimers',
            'setupStep','scheduleRetry']:
     if fn not in defs:
         errs.append(f"函数疑似未定义: {fn}")
     if re.search(r'\b' + fn + r'\s*\(', code) is None:
         errs.append(f"函数疑似未被引用: {fn}")
 
-# ---------- 6. 三个替换体必须先判 cfg 再用 orig ----------
-for fn in ['my_req', 'my_rec', 'my_bal']:
+# ---------- 6. 替换体/补丁切换必须先判 cfg.master ----------
+for fn in ['my_req', 'my_rec']:
     body = re.search(r'static BOOL ' + fn + r'\(void \*self\) \{(.*?)\n\}', code, re.S)
     if not body:
         errs.append(f"{fn} 函数体没抓到"); continue
     b = body.group(1)
     if 'cfg.master' not in b:
         errs.append(f"{fn} 没有判 cfg.master（热开关失效）")
-    if fn == 'my_bal' and 'return YES' not in b:
-        errs.append('my_bal 关闸分支必须 return YES（弹道总闸=真）')
-    if fn != 'my_bal' and 'return NO' not in b:
+    if 'return NO' not in b:
         errs.append(f'{fn} 关闸分支必须 return NO')
+# my_shoot：补弹/免冷却分支必须判 cfg.master
+msh = re.search(r'static void my_shoot\(void \*self\) \{(.*?)\n\}', code, re.S)
+if not msh:
+    errs.append('my_shoot 函数体没抓到')
+elif 'cfg.master' not in msh.group(1):
+    errs.append('my_shoot 没有判 cfg.master（master=0 仍在补弹/免冷却）')
+# updatePatches：字节补丁必须 gate cfg.master（v0.5.3 弹道/扳机两颗）
+up = re.search(r'static void updatePatches\(void\) \{(.*?)\n\}', code, re.S)
+if not up:
+    errs.append('updatePatches 函数体没抓到')
+elif 'cfg.master' not in up.group(1):
+    errs.append('updatePatches 没有判 cfg.master（master=0 补丁仍生效）')
 
-# ---------- 7. 类型一致性抽查 ----------
-checks = [
-    (r'long nReqBlocked = 0, nRecBlocked = 0, nBalForced = 0', '计数器是 long'),
-    (r'%ld  nReqBlocked, nRecBlocked, nBalForced|%ld', '心跳用 %ld 打 long'),
-    (r'\(int\)gReady', 'BOOL 打日志要 (int) 转换'),
-]
-if not re.search(r'long nReqBlocked\s*=\s*0,\s*nRecBlocked\s*=\s*0,\s*nBalForced\s*=\s*0', code):
-    errs.append('计数器定义不是 long 三连')
+# ---------- 7. 计数器/日志类型抽查 ----------
+if not re.search(r'long nReqBlocked\s*=\s*0,\s*nRecBlocked\s*=\s*0,\s*nShootRefill\s*=\s*0', code):
+    errs.append('计数器定义不是 long 三连（req/rec/refill；v0.5.3 起无 nBalForced）')
 
 # ---------- 输出 ----------
 print(f"文件: {P}  ({len(src)} 字节, {src.count(chr(10))+1} 行)")
