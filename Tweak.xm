@@ -29,8 +29,10 @@
 #include <string.h>
 #include <stdarg.h>
 
-#define TWEAK_VERSION "0.5.0"
-/* ★ v0.5.0（2026-10-16）：修 10-14 三次启动闪退（EXC_BAD_ACCESS 0x135，崩在 il2cpp 递归元数据查找）。
+#define TWEAK_VERSION "0.5.1"
+/* ★ v0.5.1（2026-10-17）：修 master 总开关不管用——my_shoot(无限弹/无冷却) 和 my_ready(扳机闸门)
+ *   漏查 cfg.master，导致 master=0 只关了进任务弹窗/弹道闸，无限弹/无冷却/扳机闸门照发。现 5 钩全 gate cfg.master。
+ * ★ v0.5.0（2026-10-16）：修 10-14 三次启动闪退（EXC_BAD_ACCESS 0x135，崩在 il2cpp 递归元数据查找）。
  *   根因：类解析旧用全类迭代 il2cpp_image_get_class + 对每个同名类调 method_from_name，
  *   冷启动半初始化元数据/同名异类会令 il2cpp 内部解引用空指针，@try/@catch 捕不了 SIGSEGV。
  *   改法：findMethodInfo 改用 il2cpp_class_from_name(image, 命名空间, 类名) 精确定位，不迭代、不误碰同名异类。
@@ -195,7 +197,7 @@ static BOOL modeAllowed(void *obj) {
 }
 
 static BOOL my_ready(void *self) {
-    if (cfg.noCd && gInCampaignMode) return TRUE;   /* ★ v0.4.0 闸门只在战役系开 */
+    if (cfg.master && cfg.noCd && gInCampaignMode) return TRUE;   /* ★ v0.5.1 补 cfg.master：master=0 必须一起闸（之前漏了，master 管不住扳机闸门） */
     return orig_ready(self);
 }
 
@@ -316,8 +318,8 @@ static void refillAmmo(void *shooter) {
 }
 static void my_shoot(void *self) {
     gInCampaignMode = modeAllowed(self);   /* ★ v0.4.0 每次开火刷新模式态（第一枪即纠正，PVP 第一发也不漏） */
-    if (cfg.infAmmo && gInCampaignMode) refillAmmo(self);
-    if (cfg.noCd && gInCampaignMode) {
+    if (cfg.master && cfg.infAmmo && gInCampaignMode) refillAmmo(self);   /* ★ v0.5.1 补 cfg.master */
+    if (cfg.master && cfg.noCd && gInCampaignMode) {                       /* ★ v0.5.1 补 cfg.master：master=0 必须一起闸（之前漏了，master 管不住无限弹/无冷却） */
         *(float *)((char *)self + 0x94) = 0.0f;   /* 冷却时长归零 */
         *(char *)((char *)self + 0x11C) = 0;      /* ★ v0.3.0 _coolingDown = false（清已启动的冷却态） */
         *(char *)((char *)self + 0x68) = 1;       /* ★ v0.3.0 IsWeaponReady backing = true */

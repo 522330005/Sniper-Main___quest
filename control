@@ -1,8 +1,8 @@
 Package: com.sniper.camp
 Name: Sniper 主线+特别行动
-Version: 0.5.0
+Version: 0.5.1
 Architecture: iphoneos-arm64
-Description: 主线/特别行动·进任务两闸+去风向/下坠+无限子弹+射击无冷却（5钩）★v0.4.0: 模式门控（PVP/活动不放行）+ 体力补满不误伤 + master=0=完全不挂钩(热开)★v0.4.1: 日志启动即清+CharacterShooter偏移经7.11.2 dump.cs逐字段验证(0xC8/0x94/0x11C/0x68一致)★v0.4.2: JSON错误可见+orig_shoot空指针守卫★v0.5.0: 修启动闪退(EXC_BAD_ACCESS 0x135)——类解析由全类迭代改 il2cpp_class_from_name 按 ns+name 精确定位(User/""/Player)，不再踩半初始化元数据/同名异类
+Description: 主线/特别行动·进任务两闸+去风向/下坠+无限子弹+射击无冷却（5钩）★v0.4.0: 模式门控（PVP/活动不放行）+ 体力补满不误伤 + master=0=完全不挂钩(热开)★v0.4.1: 日志启动即清+CharacterShooter偏移经7.11.2 dump.cs逐字段验证(0xC8/0x94/0x11C/0x68一致)★v0.4.2: JSON错误可见+orig_shoot空指针守卫★v0.5.1: 修 master 总开关不管用(my_shoot/my_ready 漏查 cfg.master，master=0 现在 5 钩全闸)★v0.5.0: 修启动闪退(EXC_BAD_ACCESS 0x135)——类解析由全类迭代改 il2cpp_class_from_name 按 ns+name 精确定位(User/""/Player)，不再踩半初始化元数据/同名异类
 Maintainer: sniper
 Author: sniper
 Section: Tweaks
